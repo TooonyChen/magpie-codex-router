@@ -8,7 +8,7 @@ through your own OpenAI Responses-compatible gateway, via a tiny local relay.
 | 平台 | 状态 |
 |---|---|
 | [macOS](macOS/) | 可用 |
-| Windows | 计划中 |
+| [Windows](windows/) | 可用 |
 
 安装和原理见各平台目录下的 README。
 
