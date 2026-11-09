@@ -1,0 +1,7 @@
+# Generated per machine; templates.json contains OpenAI's model instructions.
+templates.json
+relay.json
+catalog.json
+auth*.json
+*.log
+.DS_Store

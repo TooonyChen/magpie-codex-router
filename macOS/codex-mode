@@ -1,0 +1,150 @@
+#!/bin/bash
+# magpie-codex-router: switch Codex Desktop between two login modes.
+#   chatgpt - normal ChatGPT login. Requests still go to the gateway via the relay,
+#             but Desktop blocks sending once the ChatGPT plan's usage limit is reached.
+#   magpie  - placeholder API-key login, so that ChatGPT usage-limit check doesn't apply.
+#             ChatGPT account features are unavailable while in this mode.
+# The relay replaces whatever key Codex sends with the gateway key from Keychain,
+# so the placeholder is never used as a real credential.
+set -euo pipefail
+
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+AUTH="$CODEX_HOME/auth.json"
+CONFIG="$CODEX_HOME/config.toml"
+DIR="$CODEX_HOME/magpie-relay"
+SAVED="$DIR/auth.chatgpt.json"
+CATALOG="$DIR/catalog.json"
+PORT=$(/usr/bin/python3 -I -c 'import json,sys
+try: print(int(json.load(open(sys.argv[1])).get("port",18765)))
+except Exception: print(18765)' "$DIR/relay.json")
+RELAY="http://127.0.0.1:$PORT"
+DESKTOP_CODEX="/Applications/${CODEX_MODE_APP:-ChatGPT}.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+APP="${CODEX_MODE_APP:-ChatGPT}"
+CATALOG_LINE="model_catalog_json = \"$CATALOG\""
+
+die() { echo "错误：$*" >&2; exit 1; }
+
+auth_mode() {
+  [ -f "$AUTH" ] || { echo none; return; }
+  /usr/bin/python3 -I -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("auth_mode") or "unknown")
+except Exception: print("unreadable")' "$AUTH"
+}
+
+app_running() { pgrep -qf "/Applications/$APP.app/Contents/MacOS/$APP"; }
+
+quit_app() {
+  if app_running; then
+    read -r -p "Codex Desktop 正在运行，需要先退出（进行中的任务会中断）。继续？[y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || die "已取消，什么都没改。"
+    osascript -e "quit app \"$APP\"" >/dev/null 2>&1 || true
+    for _ in $(seq 1 30); do app_running || break; sleep 0.5; done
+    app_running && die "Desktop 没有退出，请手动完全退出后再运行。"
+    WAS_RUNNING=1
+  fi
+}
+
+reopen_app() {
+  if [ "${WAS_RUNNING:-0}" = 1 ] || [ "${1:-}" = force ]; then
+    open -a "$APP" && echo "已重新打开 Desktop。"
+  fi
+}
+
+backup_config() { cp -p "$CONFIG" "$CONFIG.bak-codex-mode"; }
+
+remove_catalog_line() {
+  /usr/bin/sed -i '' '/^model_catalog_json = /d' "$CONFIG"
+}
+
+add_catalog_line() {
+  remove_catalog_line
+  # Insert right after the model_provider line so it stays a top-level key.
+  /usr/bin/python3 -I - "$CONFIG" "$CATALOG_LINE" <<'PY'
+import sys
+p, line = sys.argv[1], sys.argv[2]
+lines = open(p).read().split("\n")
+for i, l in enumerate(lines):
+    if l.startswith("["):          # first table: insert before it as a fallback
+        lines.insert(i, line); break
+    if l.startswith("model_provider ="):
+        lines.insert(i + 1, line); break
+else:
+    lines.insert(0, line)
+open(p, "w").write("\n".join(lines))
+PY
+}
+
+client_version() {
+  # The catalog schema depends on the Codex version Desktop bundles.
+  local v=""
+  [ -x "$DESKTOP_CODEX" ] && v=$("$DESKTOP_CODEX" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  echo "${v:-0.167.0}"
+}
+
+refresh_catalog() {
+  local tmp="$CATALOG.tmp"
+  curl -sf --max-time 30 "$RELAY/v1/models?client_version=$(client_version)" -o "$tmp" \
+    || die "无法从 relay 获取模型列表，relay 在运行吗？（看 $DIR/relay.log）"
+  /usr/bin/python3 -I -c 'import json,sys
+n=len(json.load(open(sys.argv[1]))["models"]); assert n>0; print(f"模型列表已更新：{n} 个模型")' "$tmp" \
+    || { rm -f "$tmp"; die "relay 返回的模型列表无效。"; }
+  mv "$tmp" "$CATALOG"; chmod 600 "$CATALOG"
+}
+
+write_placeholder_auth() {
+  /usr/bin/python3 -I - "$AUTH" <<'PY'
+import json, os, sys
+p = sys.argv[1]
+d = {"auth_mode": "apikey", "OPENAI_API_KEY": "sk-placeholder-replaced-by-magpie-relay",
+     "tokens": None, "last_refresh": None}
+tmp = p + ".tmp"
+with open(tmp, "w") as f: json.dump(d, f, indent=2)
+os.chmod(tmp, 0o600); os.replace(tmp, p)
+PY
+}
+
+cmd_status() {
+  local mode; mode=$(auth_mode)
+  case "$mode" in
+    chatgpt) echo "当前模式：chatgpt（ChatGPT 登录，OpenAI 额度用完时 Desktop 会拦截发送）" ;;
+    apikey)  echo "当前模式：magpie（占位 API key，不受 OpenAI 额度拦截，ChatGPT 功能不可用）" ;;
+    *)       echo "当前模式：未知（auth_mode=${mode}）" ;;
+  esac
+  grep -q '^model_catalog_json = ' "$CONFIG" && echo "本地模型列表：已启用" || echo "本地模型列表：未启用"
+  [ -f "$SAVED" ] && echo "已保存的 ChatGPT 登录：有（$(stat -f '%Sm' "$SAVED")）" || echo "已保存的 ChatGPT 登录：无"
+  curl -sf --max-time 5 -o /dev/null "$RELAY/v1/models" && echo "relay：运行中" || echo "relay：未响应"
+}
+
+cmd_magpie() {
+  local mode; mode=$(auth_mode)
+  [ "$mode" = apikey ] && { echo "已经是 magpie 模式。"; refresh_catalog; return; }
+  [ "$mode" = chatgpt ] || die "当前 auth.json 不是 ChatGPT 登录（${mode}），为安全起见不切换。"
+  refresh_catalog
+  quit_app
+  mode=$(auth_mode)   # Desktop may have refreshed tokens on quit; save the latest copy.
+  [ "$mode" = chatgpt ] || die "退出 Desktop 后 auth.json 变成了 ${mode}，已停止。"
+  cp -p "$AUTH" "$SAVED"; chmod 600 "$SAVED"
+  write_placeholder_auth
+  backup_config; add_catalog_line
+  echo "已切换到 magpie 模式。ChatGPT 登录已保存到 $SAVED"
+  reopen_app
+}
+
+cmd_chatgpt() {
+  local mode; mode=$(auth_mode)
+  [ "$mode" = chatgpt ] && { echo "已经是 chatgpt 模式。"; remove_catalog_line; return; }
+  [ -f "$SAVED" ] || die "找不到已保存的 ChatGPT 登录（${SAVED}）。可以在 Desktop 里重新登录。"
+  quit_app
+  cp -p "$SAVED" "$AUTH"; chmod 600 "$AUTH"
+  backup_config; remove_catalog_line
+  echo "已切换到 chatgpt 模式。"
+  reopen_app
+}
+
+case "${1:-status}" in
+  magpie)  cmd_magpie ;;
+  chatgpt) cmd_chatgpt ;;
+  status)  cmd_status ;;
+  refresh) [ "$(auth_mode)" = apikey ] && refresh_catalog || echo "chatgpt 模式下模型列表由 relay 实时提供，无需刷新。" ;;
+  *) echo "用法：codex-mode [status|magpie|chatgpt|refresh]"; exit 2 ;;
+esac
